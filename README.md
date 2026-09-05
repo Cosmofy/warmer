@@ -52,7 +52,7 @@ PYTHONDONTWRITEBYTECODE=1 uv run pytest -v
 4. Test candidates against the actual Stellate hostname, retaining TLS verification. Validate `x-served-by` to identify the actual POP; store only globally routable addresses in Fastly's published ranges. A city's DNS result is only a candidate, not a guaranteed route to that city. Probes may be unavailable or rate limited.
 5. Save fresh mappings and errors. Missing POPs remain in the denominator. Partial discovery is useful evidence but is never complete.
 
-Globalping is an external discovery dependency. Its measurements are public: only the public Stellate hostname is submitted, never API tokens, GraphQL payloads or private infrastructure addresses. With `GLOBALPING_TOKEN`, the daily discovery packs up to 500 tests into each measurement (166 cities at the default three probes per city); without a token it stays within the anonymous 50-test limit. Candidate IP verification has a separate bounded concurrency. Warmer does not enumerate or scan IP ranges.
+Globalping is an external discovery dependency. Its measurements are public: only the public Stellate hostname is submitted, never API tokens, GraphQL payloads or private infrastructure addresses. With `GLOBALPING_TOKEN`, the daily discovery packs up to 500 tests into each measurement (166 cities at the default three probes per city), then uses the provider-reported remaining free allowance for one worldwide sample. It never purchases credits. Without a token it stays within the anonymous 50-test limit. Candidate IP verification has a separate bounded concurrency. Warmer does not enumerate or scan IP ranges.
 
 ## How warming works
 

@@ -106,6 +106,10 @@ class Provider:
             return httpx.Response(200, json=RANGES)
         if request.url.path == "/v1/probes":
             return httpx.Response(200, json=[{"location": {"city": city}} for city in self.cities])
+        if request.url.path == "/v1/limits":
+            return httpx.Response(200, json={"rateLimit": {"measurements": {"create": {
+                "type": "user", "limit": 500, "remaining": 0, "reset": 0,
+            }}}, "credits": {"remaining": 0}})
         if request.method == "POST" and request.url.path == "/v1/measurements":
             return httpx.Response(202, json={"id": "test-id", "probesCount": 3})
         if request.url.path == "/v1/measurements/test-id":
@@ -836,3 +840,37 @@ def test_unknown_actual_pop_from_local_dns_never_expands_inventory(monkeypatch):
     assert [pop.code for pop in inventory.pops] == ["AMS"]
     assert [mapping.ip for mapping in inventory.mappings] == [IP]
     assert inventory.discovery_errors == ["edge_unknown_pop"]
+
+
+def test_authenticated_daily_discovery_uses_remaining_free_tests_worldwide():
+    pops = (("AMS", "Amsterdam"), ("LHR", "London"))
+    provider = Provider(html(pops), cities=("Amsterdam",))
+    payloads = []
+
+    def respond(request):
+        if request.url.path == "/v1/limits":
+            return httpx.Response(200, json={"rateLimit": {"measurements": {"create": {
+                "type": "user", "limit": 500, "remaining": 2, "reset": 10,
+            }}}, "credits": {"remaining": 0}})
+        if request.method == "POST":
+            payload = json.loads(request.content)
+            payloads.append(payload)
+            measurement_id = "world-id" if "limit" in payload else "exact-id"
+            return httpx.Response(202, json={"id": measurement_id, "probesCount": 2})
+        if request.url.path == "/v1/measurements/exact-id":
+            return httpx.Response(200, json=measurement([dns_result("Amsterdam", (IP,))]))
+        if request.url.path == "/v1/measurements/world-id":
+            return httpx.Response(200, json=measurement([dns_result("Nearby probe", (IP2,))]))
+
+    provider.override = respond
+    edge = AsyncMock()
+    edge.request.side_effect = lambda ip, ranges, operation: edge_result(
+        ip, "AMS" if ip == IP else "LHR")
+    inventory, _ = refresh(provider, edge=edge,
+                           config=settings(globalping_token="private-token"))
+
+    assert payloads[0]["locations"] == [{"city": "Amsterdam", "limit": 3}]
+    assert payloads[1]["locations"] == [{"magic": "world"}]
+    assert payloads[1]["limit"] == 2
+    assert {mapping.pop for mapping in inventory.mappings} == {"AMS", "LHR"}
+    assert "missing_mappings:LHR" not in inventory.discovery_errors

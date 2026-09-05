@@ -364,7 +364,8 @@ class Discovery:
             result = item.get("result") if isinstance(item, dict) else None
             probe = item.get("probe") if isinstance(item, dict) else None
             city = probe.get("city") if isinstance(probe, dict) else None
-            if not isinstance(result, dict) or not isinstance(city, str) or _city_key(city) not in cities:
+            if (not isinstance(result, dict) or not isinstance(city, str)
+                    or (cities is not None and _city_key(city) not in cities)):
                 errors.add("globalping_invalid_results")
                 continue
             if result.get("status") == "in-progress" and body.get("status") == "in-progress":
@@ -389,7 +390,7 @@ class Discovery:
                     continue
                 candidates.add(ip)
                 accepted = True
-            if accepted:
+            if accepted and cities is not None:
                 completed.add(_city_key(city))
             else:
                 errors.add("globalping_no_safe_answers")
@@ -429,6 +430,46 @@ class Discovery:
                             errors.add("globalping_measurement_failed")
                         if completed != cities.keys():
                             errors.add("globalping_missing_city_results")
+                        return candidates
+                    await asyncio.sleep(POLL_INTERVAL)
+                errors.add("globalping_poll_timeout")
+        except TimeoutError:
+            errors.add("globalping_poll_timeout")
+        except _FetchError as error:
+            errors.add(str(error))
+        return candidates
+
+    async def _remaining_tests(self) -> int:
+        body = await self._json("GET", "/limits")
+        try:
+            value = body["rateLimit"]["measurements"]["create"]["remaining"]
+        except (KeyError, TypeError):
+            raise _FetchError("globalping_invalid_limits") from None
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 500:
+            raise _FetchError("globalping_invalid_limits")
+        return value
+
+    async def _measure_world(self, limit: int, ranges: list[str], errors: set[str]) -> set[str]:
+        candidates: set[str] = set()
+        try:
+            async with asyncio.timeout(POLL_TIMEOUT):
+                created = await self._json("POST", "/measurements", payload={
+                    "type": "dns",
+                    "target": urlsplit(self.settings.stellate_url).hostname,
+                    "locations": [{"magic": "world"}],
+                    "limit": limit,
+                })
+                measurement_id = created.get("id") if isinstance(created, dict) else None
+                if not isinstance(measurement_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", measurement_id):
+                    raise _FetchError("globalping_invalid_measurement")
+                if created.get("probesCount") == 0:
+                    raise _FetchError("globalping_locations_unavailable")
+                for _ in range(MAX_POLLS):
+                    body = await self._json("GET", "/measurements/" + measurement_id)
+                    self._answers(body, None, ranges, candidates, errors)
+                    if body.get("status") != "in-progress":
+                        if body.get("status") != "finished":
+                            errors.add("globalping_measurement_failed")
                         return candidates
                     await asyncio.sleep(POLL_INTERVAL)
                 errors.add("globalping_poll_timeout")
@@ -546,6 +587,25 @@ class Discovery:
                 "covered_count": len({mapping.pop for mapping in inventory.mappings}),
                 "error_code": self._api_error,
             })
+
+        # Authenticated daily runs use every remaining free test for a broad
+        # worldwide sample. This rotates through additional networks over time
+        # without purchasing credits or depending on exact city-name matches.
+        if self.settings.globalping_token and not self._api_error:
+            try:
+                remaining = await self._remaining_tests()
+            except _FetchError as error:
+                errors.add(str(error))
+            else:
+                if remaining:
+                    candidates = await self._measure_world(remaining, inventory.fastly_ranges, errors)
+                    await self._verify(candidates, inventory, checked, errors)
+                    logger.info("worldwide DNS discovery finished", extra={
+                        "event": "warmer.discovery.world_finished", "count": remaining,
+                        "candidate_count": len(candidates), "target_count": len(inventory.pops),
+                        "covered_count": len({mapping.pop for mapping in inventory.mappings}),
+                        "error_code": self._api_error,
+                    })
 
     async def refresh(self, previous: Inventory | None) -> Inventory:
         # Finish before the manager's outer job deadline so partial state can be
