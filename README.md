@@ -48,11 +48,11 @@ PYTHONDONTWRITEBYTECODE=1 uv run pytest -v
 
 1. Read Fastly's published complete POP table and public IP ranges. The count is discovered, not hardcoded to an old marketing number.
 2. Preserve all previously known target codes if the provider list shrinks. A retired/renamed POP therefore stays unresolved until an operator reviews the inventory; disappearing targets cannot make coverage suddenly look complete.
-3. Resolve the configured Stellate hostname using regional Globalping DNS probes. A city's DNS result is only a candidate, not a guaranteed route to that city. Probes may be unavailable or rate limited.
-4. Test candidates (and previous mappings) against the actual Stellate hostname, retaining TLS verification. Validate `x-served-by` to identify the actual POP; store only globally routable addresses in Fastly's published ranges.
+3. Reverify previous mappings and try bounded local DNS first. Only unresolved POP cities consume regional Globalping probes. Each batch is verified before planning the next, so new coverage can avoid unnecessary probes. Three probes per requested city remains the default.
+4. Test candidates against the actual Stellate hostname, retaining TLS verification. Validate `x-served-by` to identify the actual POP; store only globally routable addresses in Fastly's published ranges. A city's DNS result is only a candidate, not a guaranteed route to that city. Probes may be unavailable or rate limited.
 5. Save fresh mappings and errors. Missing POPs remain in the denominator. Partial discovery is useful evidence but is never complete.
 
-Globalping is an external discovery dependency. Its measurements are public: only the public Stellate hostname is submitted, never API tokens, GraphQL payloads or private infrastructure addresses. An optional `GLOBALPING_TOKEN` raises the provider's account-based allowance; monitor that allowance. Warmer does not enumerate or scan IP ranges.
+Globalping is an external discovery dependency. Its measurements are public: only the public Stellate hostname is submitted, never API tokens, GraphQL payloads or private infrastructure addresses. With `GLOBALPING_TOKEN`, the daily discovery packs up to 500 tests into each measurement (166 cities at the default three probes per city); without a token it stays within the anonymous 50-test limit. Candidate IP verification has a separate bounded concurrency. Warmer does not enumerate or scan IP ranges.
 
 ## How warming works
 

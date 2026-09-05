@@ -1,5 +1,6 @@
 import asyncio
 import json
+import socket
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from unittest.mock import AsyncMock
@@ -17,6 +18,7 @@ RANGES = {"addresses": ["151.101.0.0/16"], "ipv6_addresses": ["2a04:4e42::/32"]}
 IP = "151.101.1.1"
 IP2 = "151.101.2.1"
 OLD = datetime(2025, 1, 1, tzinfo=UTC)
+LOCAL_CANDIDATES = Discovery._local_candidates
 
 
 def html(pops=(("AMS", "Amsterdam"),)):
@@ -115,6 +117,8 @@ class Provider:
 def fast_polls(monkeypatch):
     monkeypatch.setattr(discovery, "API_INTERVAL", 0)
     monkeypatch.setattr(discovery, "POLL_INTERVAL", 0)
+    # Ordinary discovery tests must never ask the real local DNS resolver.
+    monkeypatch.setattr(Discovery, "_local_candidates", AsyncMock(return_value=set()))
 
 
 def refresh(provider, old=None, edge=None, config=None, **client_options):
@@ -319,14 +323,15 @@ def test_dns_outage_returns_initial_full_inventory_and_safe_errors(status, monke
     assert "private-token" not in inventory.model_dump_json()
 
 
-def test_dns_outage_with_full_fresh_previous_mapping_is_still_incomplete(monkeypatch):
+def test_full_fresh_previous_coverage_needs_no_globalping_even_during_outage(monkeypatch):
     monkeypatch.setattr(discovery, "REQUEST_ATTEMPTS", 1)
     provider = Provider()
     provider.override = lambda request: httpx.Response(503) if request.url.host == "api.globalping.io" else None
     inventory, edge = refresh(provider, previous())
     assert [mapping.pop for mapping in inventory.mappings] == ["AMS"]
     assert inventory.mappings[0].verified_at > OLD
-    assert inventory.discovery_errors
+    assert inventory.discovery_errors == []
+    assert all(request.url.host != "api.globalping.io" for request in provider.requests)
     edge.request.assert_awaited_once()
 
 
@@ -493,7 +498,7 @@ def test_invalid_or_missing_dns_results_are_errors(body):
     edge.request.assert_not_awaited()
 
 
-def test_batches_and_edge_requests_respect_configured_concurrency():
+def test_authenticated_measurement_is_bulk_and_edge_requests_respect_concurrency():
     pops = [(f"{i:03X}", f"City {i}") for i in range(23)]
     provider = Provider(html(pops), cities=[city for _, city in pops])
     created = {}
@@ -503,7 +508,7 @@ def test_batches_and_edge_requests_respect_configured_concurrency():
         if request.method == "POST":
             payload = json.loads(request.content)
             assert "limit" not in payload
-            assert len(payload["locations"]) <= 8
+            assert len(payload["locations"]) <= 166
             assert all(location["limit"] == 3 for location in payload["locations"])
             key = f"batch-{len(created)}"
             created[key] = payload["locations"]
@@ -526,9 +531,10 @@ def test_batches_and_edge_requests_respect_configured_concurrency():
     provider.override = respond
     edge = AsyncMock()
     edge.request.side_effect = verify
-    inventory, _ = refresh(provider, edge=edge)
+    inventory, _ = refresh(provider, edge=edge,
+                           config=settings(globalping_token="private-token"))
     assert peak == 8
-    assert len(created) == 3
+    assert len(created) == 1
     assert len(inventory.mappings) == len(inventory.pops) == 23
     assert inventory.discovery_errors == []
 
@@ -538,3 +544,295 @@ def test_cancellation_propagates():
     edge.request.side_effect = asyncio.CancelledError
     with pytest.raises(asyncio.CancelledError):
         refresh(Provider(), edge=edge)
+
+
+@pytest.mark.parametrize("probes", [1, 3, 5])
+def test_only_missing_pop_cities_get_dns_including_partly_covered_shared_city(probes):
+    pops = (("AMS", "Amsterdam"), ("RTM", "Amsterdam"), ("PAR", "Paris"), ("LHR", "London"))
+    ip3, ip4 = "151.101.3.1", "151.101.4.1"
+    old = previous(pops=pops, ips=(("AMS", IP), ("PAR", IP2)))
+    # Paris is absent from Globalping, but its POP is already freshly verified.
+    provider = Provider(html(pops), cities=("Amsterdam", "London"), results=measurement([
+        dns_result("Amsterdam", (ip3,)), dns_result("London", (ip4,)),
+    ]))
+    edge = AsyncMock()
+    actual = {IP: "AMS", IP2: "PAR", ip3: "RTM", ip4: "LHR"}
+    edge.request.side_effect = lambda ip, ranges, operation: edge_result(ip, actual[ip])
+
+    def require_previous_verification_first(request):
+        if request.url.host == "api.globalping.io":
+            assert edge.request.await_count == 2
+
+    provider.override = require_previous_verification_first
+    config = settings() if probes == 3 else settings(warmer_probes_per_city=probes)
+    assert config.warmer_probes_per_city == probes
+    inventory, _ = refresh(provider, old, edge, config)
+    payloads = [json.loads(request.content) for request in provider.requests if request.method == "POST"]
+    assert len(payloads) == 1
+    assert {location["city"] for location in payloads[0]["locations"]} == {"Amsterdam", "London"}
+    assert all(location["limit"] == probes for location in payloads[0]["locations"])
+    assert "limit" not in payloads[0]
+    assert {mapping.pop for mapping in inventory.mappings} == {pop[0] for pop in pops}
+    assert inventory.discovery_errors == []
+
+
+def test_changed_actual_pop_leaves_former_city_eligible_for_dns():
+    pops = (("AMS", "Amsterdam"), ("LHR", "London"))
+    old = previous(pops=pops)
+    provider = Provider(html(pops), cities=("Amsterdam", "London"),
+                        results=measurement([dns_result(ips=(IP2,))]))
+    edge = AsyncMock()
+    edge.request.side_effect = lambda ip, ranges, operation: edge_result(ip, "LHR" if ip == IP else "AMS")
+    inventory, _ = refresh(provider, old, edge)
+    payload = json.loads(next(request.content for request in provider.requests if request.method == "POST"))
+    assert payload["locations"] == [{"city": "Amsterdam", "limit": 3}]
+    assert [(mapping.pop, mapping.ip) for mapping in inventory.mappings] == [("AMS", IP2), ("LHR", IP)]
+    assert inventory.discovery_errors == []
+    assert old.mappings[0].pop == "AMS" and old.mappings[0].verified_at == OLD
+
+
+@pytest.mark.parametrize("status,error", [(401, "globalping_auth_failed"),
+                                         (429, "globalping_rate_limited"),
+                                         (503, "globalping_http_error")])
+def test_all_fresh_previous_candidates_survive_later_dns_failure(status, error):
+    pops = (("AMS", "Amsterdam"), ("DEL", "Delhi"))
+    old = previous(pops=pops, ips=(("AMS", IP), ("AMS", IP2)))
+    provider = Provider(html(pops), cities=("Amsterdam", "Delhi"))
+    edge = AsyncMock()
+    edge.request.side_effect = lambda ip, ranges, operation: edge_result(ip)
+
+    def fail(request):
+        if request.url.host == "api.globalping.io":
+            # Both saved addresses, including the backup for the same POP, must
+            # be reverified before any Globalping request can fail or exhaust quota.
+            assert edge.request.await_count == 2
+        if request.method == "POST":
+            assert json.loads(request.content)["locations"] == [{"city": "Delhi", "limit": 3}]
+            return httpx.Response(status, headers={"Retry-After": "999999"})
+
+    provider.override = fail
+    inventory, _ = refresh(provider, old, edge)
+    assert {mapping.ip for mapping in inventory.mappings} == {IP, IP2}
+    assert all(mapping.verified_at > OLD for mapping in inventory.mappings)
+    assert {pop.code for pop in inventory.pops} == {"AMS", "DEL"}
+    assert inventory.discovery_errors == [error, "missing_mappings:DEL"]
+    assert old.discovery_errors == ["old_failure"]
+
+
+def test_daily_refreshes_resume_from_persisted_partial_bulk_discovery():
+    pops = (("AMS", "Amsterdam"), ("CHI", "Chicago"), ("DFW", "Dallas"))
+    ips = {"Amsterdam": IP, "Chicago": IP2, "Dallas": "151.101.3.1"}
+    actual = {ip: code for (code, city), ip in zip(pops, ips.values())}
+    old = None
+    submitted_by_day = []
+    for day, expected_coverage in ((1, 1), (2, 3), (3, 3)):
+        provider = Provider(html(pops), cities=tuple(ips))
+        posted = []
+
+        def respond(request):
+            if request.method == "POST":
+                payload = json.loads(request.content)
+                assert all(location["limit"] == 3 for location in payload["locations"])
+                posted.extend(location["city"] for location in payload["locations"])
+            if "/measurements/" in request.url.path:
+                cities = (posted[:1] if day == 1 else posted)
+                return httpx.Response(200, json=measurement([
+                    dns_result(city, (ips[city],)) for city in cities
+                ]))
+
+        provider.override = respond
+        edge = AsyncMock()
+        edge.request.side_effect = lambda ip, ranges, operation: edge_result(ip, actual[ip])
+        inventory, _ = refresh(provider, old, edge,
+                               settings(globalping_token="private-token", warmer_concurrency=1))
+        assert len(inventory.pops) == 3
+        assert len(inventory.mappings) == expected_coverage
+        assert all(mapping.verified_at > OLD for mapping in inventory.mappings)
+        submitted_by_day.append(posted)
+        # Round-trip the actual persistence representation and use a new Discovery
+        # each day: no in-memory cursor or model changes are needed for resumption.
+        old = Inventory.model_validate_json(inventory.model_dump_json())
+    assert submitted_by_day == [["Amsterdam", "Chicago", "Dallas"], ["Chicago", "Dallas"], []]
+
+
+def test_authenticated_bulk_answers_can_cover_multiple_pop_cities():
+    pops = (("AMS", "Amsterdam"), ("CHI", "Chicago"), ("DFW", "Dallas"))
+    ip3 = "151.101.3.1"
+    provider = Provider(html(pops), cities=("Amsterdam", "Chicago", "Dallas"))
+    posted = []
+    verified = []
+
+    def respond(request):
+        if request.method == "POST":
+            posted.extend(location["city"] for location in json.loads(request.content)["locations"])
+        if "/measurements/" in request.url.path:
+            return httpx.Response(200, json=measurement([
+                dns_result("Amsterdam", (IP, IP2)),
+                dns_result("Chicago", (ip3,)),
+                dns_result("Dallas", (IP2,)),
+            ]))
+
+    async def verify(ip, ranges, operation):
+        verified.append(ip)
+        return edge_result(ip, {IP: "AMS", IP2: "DFW", ip3: "CHI"}[ip])
+
+    provider.override = respond
+    edge = AsyncMock()
+    edge.request.side_effect = verify
+    inventory, _ = refresh(provider, edge=edge,
+                           config=settings(globalping_token="private-token", warmer_concurrency=1))
+    assert posted == ["Amsterdam", "Chicago", "Dallas"]
+    assert len(inventory.mappings) == len(inventory.pops) == 3
+    assert inventory.discovery_errors == []
+
+
+def test_poll_quota_error_keeps_previous_and_partial_dns_candidates_even_when_all_mapped():
+    pops = (("AMS", "Amsterdam"), ("DEL", "Delhi"))
+    provider = Provider(html(pops), cities=("Amsterdam", "Delhi"))
+    polls = 0
+
+    def respond(request):
+        nonlocal polls
+        if "/measurements/" in request.url.path:
+            polls += 1
+            if polls == 1:
+                return httpx.Response(200, json=measurement([dns_result("Delhi", (IP2,))], status="in-progress"))
+            return httpx.Response(429, headers={"Retry-After": "999999"})
+
+    provider.override = respond
+    edge = AsyncMock()
+    edge.request.side_effect = lambda ip, ranges, operation: edge_result(ip, "AMS" if ip == IP else "DEL")
+    inventory, _ = refresh(provider, previous(pops=pops), edge)
+    assert {mapping.pop for mapping in inventory.mappings} == {"AMS", "DEL"}
+    assert inventory.discovery_errors == ["globalping_rate_limited"]
+    assert edge.request.await_count == 2
+    assert polls == 2
+
+
+def test_disappeared_target_still_counts_when_all_previous_mappings_reverify():
+    old = previous(pops=(("AMS", "Amsterdam"), ("RTM", "Amsterdam")), ips=(("AMS", IP), ("RTM", IP2)))
+    edge = AsyncMock()
+    edge.request.side_effect = lambda ip, ranges, operation: edge_result(ip, "AMS" if ip == IP else "RTM")
+    provider = Provider()
+    inventory, _ = refresh(provider, old, edge)
+    assert {pop.code for pop in inventory.pops} == {"AMS", "RTM"}
+    assert {mapping.pop for mapping in inventory.mappings} == {"AMS", "RTM"}
+    assert inventory.discovery_errors == ["inventory_targets_absent:RTM"]
+    assert all(request.url.host != "api.globalping.io" for request in provider.requests)
+
+
+def test_failed_previous_address_is_not_carried_forward_as_fresh():
+    provider = Provider(results=measurement([dns_result(ips=(IP2,))]))
+    edge = AsyncMock()
+    edge.request.side_effect = lambda ip, ranges, operation: edge_result(ip, success=ip != IP)
+    inventory, _ = refresh(provider, previous(), edge)
+    assert [mapping.ip for mapping in inventory.mappings] == [IP2]
+    assert inventory.discovery_errors == ["edge_verification_failed"]
+    assert any(request.method == "POST" for request in provider.requests)
+
+
+def mock_local_dns(monkeypatch, resolver):
+    monkeypatch.setattr(Discovery, "_local_candidates", LOCAL_CANDIDATES)
+    monkeypatch.setattr(asyncio.BaseEventLoop, "getaddrinfo", resolver)
+
+
+def addrinfo(ip):
+    family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+    address = (ip, 443, 0, 0) if family == socket.AF_INET6 else (ip, 443)
+    return (family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "ignored-cname.invalid", address)
+
+
+def test_local_dns_uses_configured_hostname_and_can_avoid_globalping(monkeypatch):
+    resolver = AsyncMock(return_value=[addrinfo(IP), addrinfo(IP)])
+    mock_local_dns(monkeypatch, resolver)
+    provider = Provider()
+    inventory, edge = refresh(provider, config=settings(stellate_url="https://other.stellate.sh/graphql"))
+    resolver.assert_awaited_once_with("other.stellate.sh", 443, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    edge.request.assert_awaited_once_with(IP, parse_ranges(RANGES), PROBE)
+    assert inventory.discovery_errors == []
+    assert [mapping.pop for mapping in inventory.mappings] == ["AMS"]
+    assert all(request.url.host != "api.globalping.io" for request in provider.requests)
+
+
+def test_local_dns_filters_unsafe_and_unpublished_answers_before_edge(monkeypatch):
+    ipv6 = "2a04:4e42::1"
+    resolver = AsyncMock(return_value=[addrinfo(ip) for ip in (
+        IP, ipv6, "127.0.0.1", "169.254.169.254", "100.64.0.1", "8.8.8.8", "::1", "fe80::1",
+    )])
+    mock_local_dns(monkeypatch, resolver)
+    edge = AsyncMock()
+    edge.request.side_effect = lambda ip, ranges, operation: edge_result(ip)
+    inventory, _ = refresh(Provider(), edge=edge)
+    assert {call.args[0] for call in edge.request.await_args_list} == {IP, ipv6}
+    assert {mapping.ip for mapping in inventory.mappings} == {IP, ipv6}
+    assert inventory.discovery_errors == ["local_dns_unsafe_answer"]
+
+
+@pytest.mark.parametrize("failure", [socket.gaierror("private resolver details"), OSError("private network details")])
+def test_local_dns_socket_failure_is_reported_without_hiding_globalping_success(monkeypatch, failure):
+    mock_local_dns(monkeypatch, AsyncMock(side_effect=failure))
+    inventory, _ = refresh(Provider())
+    assert [mapping.pop for mapping in inventory.mappings] == ["AMS"]
+    assert inventory.discovery_errors == ["local_dns_unavailable"]
+    assert "private" not in inventory.model_dump_json()
+
+
+def test_local_dns_deadline_is_bounded_and_error_is_retained(monkeypatch):
+    async def stalled(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(discovery, "LOCAL_DNS_TIMEOUT", 0.01)
+    mock_local_dns(monkeypatch, AsyncMock(side_effect=stalled))
+    inventory, _ = refresh(Provider())
+    assert [mapping.pop for mapping in inventory.mappings] == ["AMS"]
+    assert inventory.discovery_errors == ["local_dns_timeout"]
+
+
+def test_empty_local_dns_answer_is_not_silently_successful(monkeypatch):
+    mock_local_dns(monkeypatch, AsyncMock(return_value=[]))
+    inventory, _ = refresh(Provider())
+    assert inventory.discovery_errors == ["local_dns_no_answers"]
+
+
+def test_local_and_saved_candidates_are_verified_before_globalping_quota_failure(monkeypatch):
+    pops = (("AMS", "Amsterdam"), ("LHR", "London"), ("RTM", "Amsterdam"))
+    resolver = AsyncMock(return_value=[addrinfo(IP), addrinfo(IP2)])
+    mock_local_dns(monkeypatch, resolver)
+    provider = Provider(html(pops), cities=("Amsterdam", "London"))
+    edge = AsyncMock()
+    edge.request.side_effect = lambda ip, ranges, operation: edge_result(ip, "AMS" if ip == IP else "LHR")
+
+    def fail(request):
+        if request.url.host == "api.globalping.io":
+            assert edge.request.await_count == 2
+            resolver.assert_awaited_once()
+        if request.method == "POST":
+            # London was filled locally, but Amsterdam still lacks its RTM POP.
+            assert json.loads(request.content)["locations"] == [{"city": "Amsterdam", "limit": 3}]
+            return httpx.Response(429, headers={"Retry-After": "999999"})
+
+    provider.override = fail
+    inventory, _ = refresh(provider, previous(pops=pops), edge)
+    assert {mapping.pop for mapping in inventory.mappings} == {"AMS", "LHR"}
+    assert {pop.code for pop in inventory.pops} == {"AMS", "LHR", "RTM"}
+    assert inventory.discovery_errors == ["globalping_rate_limited", "missing_mappings:RTM"]
+    assert [call.args[0] for call in edge.request.await_args_list] == [IP, IP2]
+
+
+def test_full_saved_coverage_skips_even_local_dns(monkeypatch):
+    resolver = AsyncMock(side_effect=AssertionError("already verified: no DNS needed"))
+    mock_local_dns(monkeypatch, resolver)
+    inventory, edge = refresh(Provider(), previous())
+    resolver.assert_not_awaited()
+    edge.request.assert_awaited_once()
+    assert inventory.discovery_errors == []
+
+
+def test_unknown_actual_pop_from_local_dns_never_expands_inventory(monkeypatch):
+    mock_local_dns(monkeypatch, AsyncMock(return_value=[addrinfo(IP2)]))
+    edge = AsyncMock()
+    edge.request.side_effect = lambda ip, ranges, operation: edge_result(ip, "ZZZ" if ip == IP2 else "AMS")
+    inventory, _ = refresh(Provider(), edge=edge)
+    assert [pop.code for pop in inventory.pops] == ["AMS"]
+    assert [mapping.ip for mapping in inventory.mappings] == [IP]
+    assert inventory.discovery_errors == ["edge_unknown_pop"]

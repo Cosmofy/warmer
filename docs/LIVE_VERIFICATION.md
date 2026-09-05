@@ -5,6 +5,21 @@ The implementation is committed and pushed to Cosmofy/warmer. The initial
 with 195 tests and 12 subtests. Local tests also passed with warnings treated as
 errors. Production deployment, DNS, collectors and EventBridge have not been activated.
 
+## Latest authenticated bulk discovery
+
+Discovery now uses provider-sized measurements instead of eight-city sequential
+batches. At the default three probes per city, one authenticated measurement can
+contain up to 166 locations; candidate verification remains separately bounded.
+
+The first real bulk run completed in approximately **32 seconds** for all **164
+targets**. It freshly verified **60 POPs** and retained **104 missing POPs**, so the
+result remains explicitly incomplete. Forty-eight target city names had no exact
+currently-online Globalping city match, one DNS probe failed, and other probes
+often routed to already-covered POPs. The token remains only in ignored `.env`.
+
+This supersedes the 30-POP initial discovery below, which remains as historical
+evidence.
+
 ## Actual discovery
 
 Executed from the development Mac against `https://livia.stellate.sh`, not from

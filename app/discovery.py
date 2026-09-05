@@ -7,8 +7,10 @@ the full denominator without treating partial discovery as a successful refresh.
 
 import asyncio
 import ipaddress
+import logging
 import math
 import re
+import socket
 import unicodedata
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -23,6 +25,8 @@ from app.models import Inventory, Mapping, Pop, utc_now
 from app.provider import EdgeClient, allowed_ip
 from app.queries import PROBE
 
+logger = logging.getLogger(__name__)
+
 POPS_URL = "https://www.fastly.com/documentation/guides/getting-started/concepts/using-fastlys-global-pop-network/"
 RANGES_URL = "https://api.fastly.com/public-ip-list"
 GLOBALPING_URL = "https://api.globalping.io/v1"
@@ -33,6 +37,9 @@ POLL_TIMEOUT = 60.0
 MAX_POLLS = 100
 RETRY_AFTER_CAP = 30.0
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+LOCAL_DNS_TIMEOUT = 5.0
+ANONYMOUS_MEASUREMENT_TEST_LIMIT = 50
+AUTHENTICATED_MEASUREMENT_TEST_LIMIT = 500
 
 # Conservative special-use exclusions also catch supernets with public endpoints
 # but private interiors. No addresses are enumerated, generated, or scanned.
@@ -463,6 +470,82 @@ class Discovery:
             batch = addresses[offset:offset + self.settings.warmer_concurrency]
             checked.update(batch)
             await asyncio.gather(*(verify(ip) for ip in batch))
+        logger.info("POP candidate verification finished", extra={
+            "event": "warmer.discovery.verified", "candidate_count": len(addresses),
+            "target_count": len(inventory.pops),
+            "covered_count": len({mapping.pop for mapping in inventory.mappings}),
+        })
+
+    async def _local_candidates(self, ranges: list[str], errors: set[str]) -> set[str]:
+        # Resolve only the validated service hostname, never a URL, CNAME target,
+        # or caller-supplied DNS name. Local resolution spends no Globalping quota.
+        hostname = urlsplit(self.settings.stellate_url).hostname
+        try:
+            async with asyncio.timeout(min(LOCAL_DNS_TIMEOUT, self.settings.warmer_request_timeout)):
+                answers = await asyncio.get_running_loop().getaddrinfo(
+                    hostname, 443, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP,
+                )
+        except TimeoutError:
+            errors.add("local_dns_timeout")
+            return set()
+        except OSError:
+            errors.add("local_dns_unavailable")
+            return set()
+        candidates = set()
+        if not answers:
+            errors.add("local_dns_no_answers")
+        for family, _kind, _protocol, _canonical, address in answers:
+            ip = _candidate(address[0], ranges) if family in {socket.AF_INET, socket.AF_INET6} else None
+            if ip is None:
+                errors.add("local_dns_unsafe_answer")
+            else:
+                candidates.add(ip)
+        return candidates
+
+    async def _discover_missing(self, inventory, checked, errors):
+        covered = {mapping.pop for mapping in inventory.mappings}
+        missing_pops = [pop for pop in inventory.pops if pop.code not in covered]
+        if not missing_pops:
+            return  # Freshly verified coverage needs no Globalping requests.
+        try:
+            available = await self._available_cities()
+        except _FetchError as error:
+            errors.add(str(error))
+            available = None  # Availability is advisory; isolated batches can still work.
+        cities = {}
+        for pop in missing_pops:
+            key = _city_key(pop.city)
+            if available is not None and key not in available:
+                errors.add("globalping_city_unavailable:" + pop.code)
+            else:
+                cities.setdefault(key, available[key] if available is not None else pop.city)
+
+        # Globalping limits a measurement by tests, where each requested probe is
+        # one test. An authenticated daily run can therefore resolve as many as
+        # 166 cities at three probes each in one measurement. Network verification
+        # remains independently bounded by WARMER_CONCURRENCY.
+        test_limit = (AUTHENTICATED_MEASUREMENT_TEST_LIMIT
+                      if self.settings.globalping_token else ANONYMOUS_MEASUREMENT_TEST_LIMIT)
+        batch_size = max(1, test_limit // self.settings.warmer_probes_per_city)
+        while cities and not self._api_error:
+            covered = {mapping.pop for mapping in inventory.mappings}
+            missing_cities = {_city_key(pop.city) for pop in missing_pops if pop.code not in covered}
+            items = [(key, city) for key, city in cities.items() if key in missing_cities]
+            batch = dict(items[:batch_size])
+            if not batch:
+                break
+            for key in batch:
+                del cities[key]  # At most one DNS measurement per city per refresh.
+            # Finish and verify this batch before spending quota on another.
+            # Actual POPs can fill other cities' gaps, including shared-city POPs.
+            candidates = await self._measure(batch, inventory.fastly_ranges, errors)
+            await self._verify(candidates, inventory, checked, errors)
+            logger.info("regional DNS discovery batch finished", extra={
+                "event": "warmer.discovery.batch_finished", "count": len(batch),
+                "candidate_count": len(candidates), "target_count": len(inventory.pops),
+                "covered_count": len({mapping.pop for mapping in inventory.mappings}),
+                "error_code": self._api_error,
+            })
 
     async def refresh(self, previous: Inventory | None) -> Inventory:
         # Finish before the manager's outer job deadline so partial state can be
@@ -495,27 +578,10 @@ class Discovery:
             async with asyncio.timeout_at(deadline):
                 await self._verify([mapping.ip for mapping in previous.mappings] if previous else [],
                                    inventory, checked, errors)
-                try:
-                    available = await self._available_cities()
-                except _FetchError as error:
-                    errors.add(str(error))
-                    available = None  # Availability is advisory; isolated batches can still work.
-                cities = {}
-                for pop in inventory.pops:
-                    key = _city_key(pop.city)
-                    if available is not None and key not in available:
-                        errors.add("globalping_city_unavailable:" + pop.code)
-                    else:
-                        cities.setdefault(key, available[key] if available is not None else pop.city)
-                items = list(cities.items())
-                # At most eight cities (40 probes with the largest setting) per
-                # POST also fits Globalping's anonymous 50-probe measurement cap.
-                batch_size = min(8, self.settings.warmer_concurrency)
-                batches = [dict(items[i:i + batch_size]) for i in range(0, len(items), batch_size)]
-                for offset in range(0, len(batches), self.settings.warmer_concurrency):
-                    results = await asyncio.gather(*(self._measure(batch, ranges, errors)
-                                                    for batch in batches[offset:offset + self.settings.warmer_concurrency]))
-                    await self._verify(set().union(*results), inventory, checked, errors)
+                if targets.keys() - {mapping.pop for mapping in inventory.mappings}:
+                    candidates = await self._local_candidates(ranges, errors)
+                    await self._verify(candidates, inventory, checked, errors)
+                await self._discover_missing(inventory, checked, errors)
         except TimeoutError:
             errors.add("discovery_timeout")
         missing = targets.keys() - {mapping.pop for mapping in inventory.mappings}
