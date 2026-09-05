@@ -2,6 +2,8 @@
 
 Cosmofy's FastAPI service for discovering Stellate/Fastly POP addresses and warming server-owned GraphQL queries. Built in the same format as APOD, News and Articles. Version 1.0.0.
 
+Current verified status: [live test results and coverage gaps](docs/LIVE_VERIFICATION.md). The initial live run mapped 30 of 164 targets; full worldwide coverage and production activation are not complete.
+
 ## Operations
 
 | Method | Path | Purpose |
@@ -18,7 +20,7 @@ Cosmofy's FastAPI service for discovering Stellate/Fastly POP addresses and warm
 
 All operations except health require `Authorization: Bearer <WARMER_API_TOKEN>`. This is an administration API: a public unauthenticated call could trigger hundreds of requests. Request bodies cannot supply queries, URLs, addresses, credentials or mutations.
 
-POST requests return **202 Accepted** with a run ID and `Location` pointing to its status. Accepted does not mean completed. Only `status: complete` means the operation covered every target without unresolved discovery errors. `incomplete`, `failed`, and `interrupted` must be treated as unsuccessful by automation.
+POST requests return **202 Accepted** with a run ID and `Location` pointing to its status. Accepted does not mean completed. Only `status: complete` means the operation covered every target; discovery additionally requires no unresolved discovery errors. Warming evaluates fresh mappings and actual responses independently. `incomplete`, `failed`, and `interrupted` must be treated as unsuccessful by automation.
 
 ## Run locally
 

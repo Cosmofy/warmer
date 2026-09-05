@@ -156,6 +156,10 @@ def parse_pops(document: str) -> list[Pop]:
     if parser.invalid or parser.in_table or len(rows) < 2:
         raise DiscoveryError("inventory_invalid")
     headers = [cell.casefold() for cell in rows[0]]
+    # Fastly's negotiated markdown has returned only the metro-sites table
+    # under this heading. That is not the full target inventory, even on first run.
+    if "sites spanned" in headers:
+        raise DiscoveryError("inventory_invalid")
     try:
         city_index = headers.index("location")
         code_index = headers.index("pop identifier")

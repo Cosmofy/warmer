@@ -50,6 +50,12 @@ def settings(**overrides):
     return Settings(_env_file=None, warmer_api_token="x" * 32, **overrides)
 
 
+def test_metro_only_markdown_cannot_bootstrap_a_partial_target_list():
+    document = markdown().replace("Approx location", "Sites spanned")
+    with pytest.raises(DiscoveryError, match="inventory_invalid"):
+        parse_pops(document)
+
+
 def previous(pops=(("AMS", "Amsterdam"),), ips=(("AMS", IP),)):
     return Inventory(fetched_at=OLD, source="old", pops=[Pop(code=code, city=city) for code, city in pops],
                      fastly_ranges=RANGES["addresses"],
