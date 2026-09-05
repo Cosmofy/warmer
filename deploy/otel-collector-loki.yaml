@@ -1,0 +1,36 @@
+# OPTIONAL additive overlay; never replace otel-collector.yaml with this file.
+# No endpoint is selected. Use a verified private shared Loki OTLP base URL
+# ending in /otlp, not /loki/api/v1/push or /otlp/v1/logs.
+# Load as the SECOND --config after warmer.yaml only after separate approval.
+processors:
+  batch/loki:
+    send_batch_size: 256
+    timeout: 5s
+
+exporters:
+  otlphttp/loki:
+    endpoint: ${env:LOKI_OTLP_ENDPOINT}
+    timeout: 5s
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 512
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 10s
+      max_elapsed_time: 60s
+
+service:
+  pipelines:
+    logs/loki:
+      receivers:
+        - journald/warmer
+      processors:
+        - memory_limiter
+        - transform/warmer_logs
+        - resource/warmer
+        - batch/loki
+      exporters:
+        - otlphttp/loki

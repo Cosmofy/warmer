@@ -1,0 +1,27 @@
+# OPTIONAL, PREPARATION ONLY. Never required by the application unit.
+[Unit]
+Description=OpenTelemetry Collector for Cosmofy Warmer
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/cosmofy/warmer-bootstrapped
+
+[Service]
+Type=simple
+User=otelcol-contrib
+Group=otelcol-contrib
+EnvironmentFile=/etc/cosmofy/warmer-otel.env
+ExecStart=/usr/bin/otelcol-contrib --config=/etc/otelcol-contrib/warmer.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+SupplementaryGroups=systemd-journal
+ReadWritePaths=/var/lib/otelcol-contrib/warmer
+UMask=0077
+MemoryMax=256M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

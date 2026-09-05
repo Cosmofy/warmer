@@ -1,0 +1,9 @@
+# PREPARATION ONLY. Domain/certificates are deliberately unusable placeholders.
+# Port 29404 is an UNVERIFIED PLACEHOLDER; check the selected host before use.
+# Import only after explicit DNS/TLS/network/auth approval and bootstrap.
+warmer.example.invalid {
+    tls /etc/caddy/certs/warmer.example.invalid.crt /etc/caddy/certs/warmer.example.invalid.key
+    encode gzip zstd
+    header Cache-Control "no-store"
+    reverse_proxy 127.0.0.1:29404
+}

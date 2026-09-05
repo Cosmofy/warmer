@@ -1,0 +1,64 @@
+name: Deploy Warmer (manual, post-bootstrap only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type deploy-warmer after explicit deployment approval
+        required: true
+        type: string
+      runs_drained:
+        description: Triggers are paused, runs drained, SQLite backed up, rollback compatibility reviewed
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-warmer-production
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'deploy-warmer' && inputs.runs_drained
+    uses: ./.github/workflows/tests.yml
+
+  deploy:
+    name: Update the single approved OCI instance
+    needs: tests
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'deploy-warmer' && inputs.runs_drained
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    env:
+      # No host, location or port fallback. Use the existing deployment interface.
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+      APP_PORT: ${{ vars.WARMER_APP_PORT }}
+      WARMER_DEPLOY_ENABLED: ${{ vars.WARMER_DEPLOY_ENABLED }}
+      WARMER_BOOTSTRAPPED: ${{ vars.WARMER_BOOTSTRAPPED }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+
+    steps:
+      - name: Require approved bootstrap and configured deployment access
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$WARMER_DEPLOY_ENABLED" = true
+          test "$WARMER_BOOTSTRAPPED" = true
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]]
+          [[ "$APP_PORT" =~ ^[1-9][0-9]{3,4}$ ]]
+          (( APP_PORT >= 1024 && APP_PORT <= 65535 ))
+
+      - name: Check out tested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Release without transferring secrets or state
+        shell: bash
+        run: bash deploy/release.sh

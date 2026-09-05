@@ -1,0 +1,106 @@
+# OPTIONAL, PREPARATION ONLY. 25318 and 13136 are UNVERIFIED PLACEHOLDERS.
+# Loopback HTTP only: no public OTLP, no extra gRPC listener, no shared config edit.
+extensions:
+  health_check:
+    endpoint: 127.0.0.1:13136
+  file_storage:
+    directory: /var/lib/otelcol-contrib/warmer
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:25318
+  journald/warmer:
+    start_at: end
+    units:
+      - cosmofy-warmer.service
+    priority: info
+    storage: file_storage
+    retry_on_failure:
+      enabled: true
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 128
+    spike_limit_mib: 32
+  transform/warmer_logs:
+    error_mode: ignore
+    log_statements:
+      - context: log
+        statements:
+          - set(log.body, log.body["MESSAGE"]) where IsMap(log.body) and log.body["MESSAGE"] != nil
+  resource/warmer:
+    attributes:
+      - key: service.name
+        value: warmer
+        action: upsert
+      - key: service.namespace
+        value: cosmofy
+        action: upsert
+      - key: service.instance.id
+        value: ${env:OTEL_NODE_NAME}
+        action: upsert
+      - key: host.name
+        value: ${env:OTEL_NODE_NAME}
+        action: upsert
+      - key: deployment.environment.name
+        value: production
+        action: upsert
+      - key: deployment.platform
+        value: oracle-cloud
+        action: upsert
+  batch:
+    send_batch_size: 512
+    timeout: 5s
+
+exporters:
+  awsxray:
+    region: eu-west-2
+    local_mode: true
+    max_retries: 3
+    request_timeout_seconds: 10
+    aws_log_groups:
+      - /cosmofy/warmer/production
+    indexed_attributes:
+      - http.route
+      - http.response.status_code
+  awscloudwatchlogs:
+    region: eu-west-2
+    log_group_name: /cosmofy/warmer/production
+    log_stream_name: ${env:OTEL_NODE_NAME}
+    raw_log: true
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 1000
+      storage: file_storage
+
+service:
+  telemetry:
+    metrics:
+      level: none
+  extensions:
+    - health_check
+    - file_storage
+  pipelines:
+    traces:
+      receivers:
+        - otlp
+      processors:
+        - memory_limiter
+        - resource/warmer
+        - batch
+      exporters:
+        - awsxray
+    logs:
+      receivers:
+        - journald/warmer
+      processors:
+        - memory_limiter
+        - transform/warmer_logs
+        - resource/warmer
+        - batch
+      exporters:
+        - awscloudwatchlogs

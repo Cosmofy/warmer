@@ -1,0 +1,56 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      OTEL_SDK_DISABLED: "true"
+      OTEL_TRACES_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+      OTEL_METRICS_EXPORTER: none
+      WARMER_API_TOKEN: warmer-ci-only-token-not-for-production-0001
+      # Syntactically valid only; tests must mock all upstream traffic.
+      STELLATE_URL: https://warmer-ci.stellate.sh
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.14
+
+      - name: Install dependencies
+        run: uv sync --locked --dev --python 3.14
+
+      - name: Run tests
+        env:
+          WARMER_STATE_DB: ${{ runner.temp }}/warmer-ci-state.db
+        run: |
+          mkdir -p test-results
+          uv run --locked pytest -v --junitxml=test-results/pytest.xml
+
+      - name: Upload individual test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: warmer-pytest-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test-results/pytest.xml
+          if-no-files-found: warn
+          retention-days: 14
